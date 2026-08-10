@@ -1,0 +1,17 @@
+# IntelliJ
+.idea/
+*.iml
+out/
+
+# Gradle
+.gradle/
+build/
+
+# Local configuration / secrets
+.env
+.env.*
+local.properties
+
+# OS
+.DS_Store
+Thumbs.db
