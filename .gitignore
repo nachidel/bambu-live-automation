@@ -15,3 +15,7 @@ local.properties
 # OS
 .DS_Store
 Thumbs.db
+/*.url
+
+config/
+youtube-token/

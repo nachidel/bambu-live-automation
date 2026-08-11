@@ -8,7 +8,7 @@ import java.net.InetAddress
 class WakeOnLanService(
     private val macAddress: String,
     private val broadcastAddress: String,
-    private val port: Int = 9
+    private val port: Int = 7
 ) {
 
     private val logger =
