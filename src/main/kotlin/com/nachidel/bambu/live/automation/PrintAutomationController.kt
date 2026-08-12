@@ -1,6 +1,7 @@
 package com.nachidel.bambu.live.automation
 
 import com.nachidel.bambu.event.BambuEvent
+import com.nachidel.bambu.live.obs.ObsOverlayServer
 import com.nachidel.bambu.model.PrinterState
 
 class PrintAutomationController {
@@ -73,6 +74,8 @@ class PrintAutomationController {
             }
 
             is BambuEvent.PrinterStatusChanged -> {
+                ObsOverlayServer.update(event.snapshot)
+
                 reconcileState(
                     event.snapshot.state,
                     actions

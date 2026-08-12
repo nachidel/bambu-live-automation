@@ -7,6 +7,7 @@ import com.nachidel.bambu.live.bambu.BambuPrinterService
 import com.nachidel.bambu.live.camera.BambuCameraService
 import com.nachidel.bambu.live.live.LiveStreamingService
 import com.nachidel.bambu.live.obs.ObsMonitor
+import com.nachidel.bambu.live.obs.ObsOverlayServer
 import com.nachidel.bambu.live.obs.ObsWebSocketClient
 import com.nachidel.bambu.live.simulator.BambuEventSimulator
 import com.nachidel.bambu.live.studio.StudioPcMonitor
@@ -611,6 +612,8 @@ fun main() = runBlocking {
              * OBS -> YOUTUBE
              * ----------------------------------------------------
              */
+
+            ObsOverlayServer.start()
 
             automationLogger.info(
                 "Starting live streaming for '{}' privacy={}",

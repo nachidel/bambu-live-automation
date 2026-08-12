@@ -50,7 +50,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.nachidel:bambu-cloud-kotlin:0.1.0")
+    implementation("com.nachidel:bambu-cloud-kotlin:0.1.5")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("org.slf4j:slf4j-api:2.0.17")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
