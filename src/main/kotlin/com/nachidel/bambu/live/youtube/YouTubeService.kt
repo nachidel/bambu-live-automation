@@ -35,6 +35,9 @@ class YouTubeService(
 
         private val ALLOWED_TRANSITIONS =
             setOf("live", "testing", "complete")
+
+        private const val MAX_THUMBNAIL_BYTES =
+            2 * 1024 * 1024
     }
 
     private val json =
@@ -169,6 +172,7 @@ class YouTubeService(
                     title = title,
                     description = description,
                     privacyStatus = privacyStatus,
+                    forKids = true,
                     enableAutoStart = false,
                     enableAutoStop = false
                 )
@@ -188,6 +192,7 @@ class YouTubeService(
                     title = "Test bambu-live-automation",
                     description = "Test automatique bambu-live-automation",
                     privacyStatus = "private",
+                    forKids = true,
                     enableAutoStart = false,
                     enableAutoStop = false
                 )
@@ -212,6 +217,7 @@ class YouTubeService(
                     title = "LIVE TEST bambu-live-automation",
                     description = "Private automatic live test",
                     privacyStatus = "private",
+                    forKids = true,
                     enableAutoStart = false,
                     enableAutoStop = false
                 )
@@ -220,6 +226,68 @@ class YouTubeService(
                 broadcastId = broadcast.id,
                 streamId = stream.id
             )
+        }
+
+    suspend fun setThumbnail(
+        videoId: String,
+        image: ByteArray,
+        contentType: String
+    ) =
+        withContext(Dispatchers.IO) {
+            require(videoId.isNotBlank()) {
+                "YouTube videoId is empty"
+            }
+
+            require(image.isNotEmpty()) {
+                "YouTube thumbnail is empty"
+            }
+
+            require(image.size <= MAX_THUMBNAIL_BYTES) {
+                "YouTube thumbnail exceeds the 2 MB limit: ${image.size} bytes"
+            }
+
+            val uploadContentType =
+                when (contentType.lowercase()) {
+                    "image/jpeg",
+                    "image/jpg" -> "image/jpeg"
+
+                    "image/png" -> "image/png"
+
+                    else -> "application/octet-stream"
+                }
+
+            val accessToken = oauth.accessToken()
+
+            val request =
+                HttpRequest.newBuilder(
+                    URI.create(
+                        "https://www.googleapis.com/upload/youtube/v3/thumbnails/set" +
+                                "?videoId=${urlEncode(videoId)}" +
+                                "&uploadType=media"
+                    )
+                )
+                    .header("Authorization", "Bearer $accessToken")
+                    .header("Accept", "application/json")
+                    .header("Content-Type", uploadContentType)
+                    .POST(
+                        HttpRequest.BodyPublishers.ofByteArray(
+                            image
+                        )
+                    )
+                    .build()
+
+            val response =
+                httpClient.send(
+                    request,
+                    HttpResponse.BodyHandlers.ofString()
+                )
+
+            if (response.statusCode() !in 200..299) {
+                error(
+                    "Unable to set YouTube thumbnail " +
+                            "(${response.statusCode()}): ${response.body()}"
+                )
+            }
         }
 
     suspend fun getBroadcast(
@@ -473,6 +541,7 @@ class YouTubeService(
         title: String,
         description: String,
         privacyStatus: String,
+        forKids: Boolean,
         enableAutoStart: Boolean = false,
         enableAutoStop: Boolean = false
     ): YouTubeLiveBroadcastInfo {
@@ -510,7 +579,7 @@ class YouTubeService(
                     "status",
                     buildJsonObject {
                         put("privacyStatus", privacyStatus)
-                        put("selfDeclaredMadeForKids", false)
+                        put("selfDeclaredMadeForKids", forKids)
                     }
                 )
 

@@ -41,9 +41,11 @@ bambu-live-automation
     └── LiveStreamingService
            │
            ├── stream YouTube réutilisable
-           ├── broadcast YouTube
+           ├── session persistante par job Bambu
+           ├── création ou reprise du broadcast YouTube
+           ├── thumbnail Bambu Cloud -> YouTube
            ├── configuration OBS RTMPS
-           ├── StartStream
+           ├── StartStream ou adoption d'OBS
            ├── attente ingestion
            ├── transition LIVE
            └── transition COMPLETE
@@ -77,14 +79,16 @@ Sur `PREPARING` ou `PRINTING` :
 6. il attend OBS WebSocket ;
 7. il démarre le bridge caméra H2C ;
 8. il prépare le stream YouTube réutilisable ;
-9. il configure OBS avec l'adresse RTMPS et la clé du stream ;
-10. il crée un broadcast YouTube ;
-11. il associe le broadcast au stream ;
-12. il démarre OBS ;
-13. il attend que le stream OBS soit réellement actif ;
-14. il attend que YouTube indique que l'ingestion est `active` ;
-15. il demande la transition du broadcast vers `live` ;
-16. il attend le passage `liveStarting -> live`.
+9. il recherche une session persistée correspondant au même `jobId` Bambu ;
+10. si une session valide existe, il reprend le broadcast existant ; sinon il en crée un nouveau ;
+11. il associe le broadcast au stream si nécessaire ;
+12. il applique la miniature Bambu Cloud au broadcast YouTube lorsqu'elle est disponible ;
+13. il configure OBS avec l'adresse RTMPS et la clé du stream ;
+14. il démarre OBS ou adopte le stream OBS déjà actif s'il correspond à la session reprise ;
+15. il attend que le stream OBS soit réellement actif ;
+16. il attend que YouTube indique que l'ingestion est `active` ;
+17. il demande la transition du broadcast vers `live` si nécessaire ;
+18. il attend le passage `liveStarting -> live`.
 
 Le programme privilégie les états réels à des temporisations fixes.
 
@@ -94,7 +98,25 @@ Le programme sait reprendre une impression déjà en cours.
 
 Si la H2C est déjà en `PRINTING` au moment de la connexion Bambu Cloud, la réconciliation d'état déclenche le workflow de live.
 
-Ce scénario a été validé sur une vraie impression.
+Le programme persiste également la session YouTube dans :
+
+```text
+state/youtube-live-session.properties
+```
+
+Ce fichier contient :
+
+```text
+jobId
+broadcastId
+streamId
+```
+
+Au redémarrage, si le `jobId` Bambu est identique, que le même stream réutilisable est utilisé, que le broadcast est toujours lié à ce stream et que son état YouTube est `ready`, `testing`, `liveStarting` ou `live`, le programme reprend ce broadcast au lieu d'en créer un nouveau.
+
+Si OBS diffuse encore cette même session, le stream OBS est adopté sans être redémarré.
+
+Un arrêt normal du processus se contente de se détacher de la session afin de permettre cette reprise. `FINISHED` ou `FAILED` restent les événements qui terminent réellement le broadcast et arrêtent OBS.
 
 ## Pause
 
@@ -129,15 +151,22 @@ Le broadcast est terminé avant l'arrêt de la vidéo.
 
 Le programme ne doit pas arrêter un stream lancé manuellement.
 
-Au démarrage, si OBS est déjà en train de streamer :
+Au démarrage, si OBS est déjà en train de streamer, deux cas existent :
 
 ```text
-OBS déjà actif
+session persistée + même jobId + même stream YouTube
+→ l'automatisation adopte le stream OBS existant
+```
+
+Sinon :
+
+```text
+OBS déjà actif sans session correspondante
 → l'automatisation refuse de prendre possession du stream
 → elle ne l'arrêtera pas
 ```
 
-Quand l'automatisation demande elle-même `StartStream`, elle conserve l'information permettant de savoir que ce stream lui appartient.
+Quand l'automatisation demande elle-même `StartStream`, elle conserve également l'information permettant de savoir que ce stream lui appartient.
 
 La clé de stream YouTube ne doit jamais apparaître dans les logs.
 
@@ -294,7 +323,7 @@ La clé de stream retournée par l'API n'est jamais loggée.
 
 ## Broadcast par impression
 
-Chaque impression crée un nouveau broadcast.
+Une nouvelle impression crée un nouveau broadcast. En revanche, si le programme redémarre pendant la même impression et retrouve une session persistée valide pour le même `jobId`, il reprend le broadcast existant au lieu d'en créer un second.
 
 Titre actuel :
 
@@ -316,19 +345,30 @@ YOUTUBE_PRIVACY=unlisted
 YOUTUBE_PRIVACY=public
 ```
 
+Audience :
+
+```text
+selfDeclaredMadeForKids=false
+```
+
+Les broadcasts créés par le programme sont donc déclarés **« non conçus pour les enfants »**. Ce réglage est indépendant de `YOUTUBE_PRIVACY`.
+
 ## Cycle de vie
 
 Le programme pilote explicitement le live :
 
 ```text
-create broadcast
-→ bind reusable stream
-→ start OBS
+find persisted session for current jobId
+→ resume broadcast OR create broadcast
+→ bind reusable stream when creating
+→ apply Bambu Cloud thumbnail when available
+→ start OBS OR adopt matching active OBS stream
 → wait OBS active
 → wait YouTube ingestion active
-→ transition live
+→ transition live when necessary
 → wait liveStarting -> live
 → diffusion
+→ FINISHED / FAILED
 → transition complete
 → stop OBS
 ```
@@ -368,7 +408,7 @@ YOUTUBE_AUTH_TEST=true
 Le programme utilise la bibliothèque :
 
 ```text
-com.nachidel:bambu-cloud-kotlin:0.1.0
+com.nachidel:bambu-cloud-kotlin:<bambuCloudVersion>
 ```
 
 Le token Bambu est fourni avec :
@@ -378,6 +418,14 @@ BAMBU_TOKEN
 ```
 
 Le suivi de l'impression reste basé sur Bambu Cloud. Il n'est pas nécessaire de passer la H2C en mode LAN pour recevoir les états d'impression.
+
+La version de la bibliothèque peut être définie dans `gradle.properties` :
+
+```properties
+bambuCloudVersion=VERSION_PUBLIEE
+```
+
+Elle doit contenir `BambuCloudClient.latestTask()` et `PrintTask.cover` pour la récupération directe de la miniature.
 
 ---
 
@@ -412,6 +460,7 @@ Pour une automatisation complète, OBS doit également démarrer automatiquement
 | Variable | Défaut | Obligatoire | Description |
 |---|---|---:|---|
 | `BAMBU_TOKEN` | aucun | oui en réel | Token Bambu Cloud. |
+| `BAMBU_PRINTER_SERIAL` | aucun | seulement si plusieurs imprimantes | Numéro de série de l’imprimante Bambu à utiliser pour les tâches Cloud et le thumbnail. |
 | `BAMBU_SIMULATION` | `false` | non | Utilise le simulateur au lieu de Bambu Cloud. |
 
 ## Caméra
@@ -534,7 +583,7 @@ Lancement :
 Le build récupère :
 
 ```text
-com.nachidel:bambu-cloud-kotlin:0.1.0
+com.nachidel:bambu-cloud-kotlin:<bambuCloudVersion>
 ```
 
 Dans :
@@ -587,6 +636,26 @@ Le programme configure automatiquement la destination de streaming OBS avec le s
 ---
 
 # H2C OBS overlay - thumbnail + dual head temperatures
+
+## Miniature Bambu Cloud
+
+La miniature n’est plus extraite du fichier 3MF. Au début d’un nouveau job,
+`bambu-live-automation` demande la dernière tâche à `bambu-cloud-kotlin` et
+utilise directement son champ `cover`. Le téléchargement de l’image reste
+asynchrone et le résultat est mis en cache localement pour OBS.
+
+La même image est également envoyée au broadcast YouTube avec `thumbnails.set`.
+Si la miniature Bambu n'est pas encore disponible au moment de la création du
+broadcast, le live continue normalement avec la miniature par défaut de YouTube.
+Une erreur d'envoi de thumbnail ne bloque jamais le démarrage du live.
+
+Si le compte Bambu contient plusieurs imprimantes, définir `BAMBU_PRINTER_SERIAL`
+pour éviter toute sélection implicite.
+
+La propriété Gradle `bambuCloudVersion` permet de choisir la version publiée de
+`bambu-cloud-kotlin`. Elle doit référencer une version contenant `latestTask()`
+et le champ `PrintTask.cover`.
+
 
 ## Correction importante
 
@@ -735,7 +804,26 @@ YOUTUBE_PRIVACY=public
 
 ## OBS est déjà en train de streamer
 
-L'automatisation refuse volontairement de prendre le contrôle du stream existant.
+Si une session persistée correspond au même `jobId`, au même stream YouTube et à un broadcast encore reprenable, l'automatisation adopte le stream OBS existant.
+
+Dans tous les autres cas, elle refuse volontairement de prendre le contrôle du stream existant.
+
+## Un nouveau broadcast est créé après redémarrage alors que l'impression continue
+
+Vérifier la présence de :
+
+```text
+state/youtube-live-session.properties
+```
+
+et s'assurer que :
+
+- le `jobId` Bambu courant est identique à celui persisté ;
+- le `streamId` correspond toujours au stream réutilisable ;
+- le broadcast YouTube est encore dans un état reprenable (`ready`, `testing`, `liveStarting` ou `live`) ;
+- le broadcast est toujours lié au stream attendu.
+
+Si le broadcast est déjà `complete`, il ne peut pas être repris et un nouveau broadcast doit être créé.
 
 ## Aucune image H2C
 
@@ -795,7 +883,8 @@ src/main/kotlin/com/nachidel/bambu/live/
 ├── camera/
 │   └── BambuCameraService.kt
 ├── live/
-│   └── LiveStreamingService.kt
+│   ├── LiveStreamingService.kt
+│   └── LiveSessionStore.kt
 ├── obs/
 │   ├── ObsMonitor.kt
 │   └── ObsWebSocketClient.kt
@@ -845,7 +934,11 @@ Streams réutilisables, broadcasts, bind et transitions YouTube.
 
 ### `LiveStreamingService`
 
-Orchestration OBS/YouTube, gestion de propriété et nettoyage.
+Orchestration OBS/YouTube, création ou reprise du broadcast, gestion de propriété et nettoyage.
+
+### `LiveSessionStore`
+
+Persiste `jobId`, `broadcastId` et `streamId` afin de reprendre le même live après un redémarrage du programme pendant la même impression.
 
 ---
 
@@ -866,6 +959,7 @@ local.properties
 
 config/
 youtube-token/
+state/
 ```
 
 Ne jamais commiter :
@@ -903,7 +997,15 @@ Validé en réel ou par simulation :
 - H264 brut -> FFmpeg ;
 - RTP -> OBS ;
 - visibilité YouTube configurable ;
+- audience YouTube déclarée « non conçue pour les enfants » ;
+- thumbnail Bambu Cloud utilisé dans OBS et envoyé à YouTube ;
 - protection d'un stream OBS déjà existant.
+
+Implémenté dans le workflow actuel :
+
+- persistance `jobId` / `broadcastId` / `streamId` ;
+- reprise du même broadcast après redémarrage lorsque la même impression est toujours active ;
+- adoption d'un stream OBS déjà actif uniquement lorsqu'il correspond à cette session persistée.
 
 ---
 
@@ -950,10 +1052,14 @@ PC Windows
 ```text
 H2C
 → Bambu Cloud
+→ récupération du cover
 → PC studio
 → caméra H2C
 → OBS
+→ création ou reprise du broadcast YouTube
+→ thumbnail YouTube
 → YouTube LIVE
+→ redémarrage éventuel du programme : reprise si même jobId
 → FINISHED / FAILED
 → YouTube COMPLETE
 → OBS stop

@@ -8,6 +8,7 @@ import com.nachidel.bambu.live.camera.BambuCameraService
 import com.nachidel.bambu.live.live.LiveStreamingService
 import com.nachidel.bambu.live.obs.ObsMonitor
 import com.nachidel.bambu.live.obs.ObsOverlayServer
+import com.nachidel.bambu.live.obs.ObsThumbnailImage
 import com.nachidel.bambu.live.obs.ObsWebSocketClient
 import com.nachidel.bambu.live.simulator.BambuEventSimulator
 import com.nachidel.bambu.live.studio.StudioPcMonitor
@@ -114,6 +115,9 @@ fun main() = runBlocking {
 
     val obsPassword =
         envString("OBS_PASSWORD")
+
+    val bambuPrinterSerial =
+        envString("BAMBU_PRINTER_SERIAL")
 
     val isWindows =
         System.getProperty("os.name")
@@ -542,13 +546,43 @@ fun main() = runBlocking {
         return true
     }
 
+    suspend fun waitForCloudThumbnail(
+        jobId: String?,
+        timeoutMs: Long = 10_000
+    ): ObsThumbnailImage? {
+        val resolvedJobId =
+            jobId
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return null
+
+        val deadline =
+            System.currentTimeMillis() + timeoutMs
+
+        while (System.currentTimeMillis() < deadline) {
+            ObsOverlayServer
+                .currentThumbnail(resolvedJobId)
+                ?.let {
+                    return it
+                }
+
+            delay(250)
+        }
+
+        return ObsOverlayServer
+            .currentThumbnail(resolvedJobId)
+    }
+
     /*
      * ============================================================
      * START LIVE WORKFLOW
      * ============================================================
      */
 
-    suspend fun startLive(printName: String) {
+    suspend fun startLive(
+        printName: String,
+        jobId: String?
+    ) {
         var cameraStarted = false
 
         try {
@@ -621,9 +655,25 @@ fun main() = runBlocking {
                 youtubePrivacy
             )
 
+            val youtubeThumbnail =
+                waitForCloudThumbnail(jobId)
+
+            if (youtubeThumbnail != null) {
+                automationLogger.info(
+                    "Using Bambu Cloud thumbnail for YouTube broadcast"
+                )
+            } else {
+                automationLogger.warn(
+                    "Bambu Cloud thumbnail not ready; YouTube will use its default thumbnail"
+                )
+            }
+
             val started =
                 liveService.start(
-                    printName = printName
+                    printName = printName,
+                    jobId = jobId,
+                    thumbnailBytes = youtubeThumbnail?.bytes,
+                    thumbnailContentType = youtubeThumbnail?.contentType
                 )
 
             if (!started) {
@@ -689,6 +739,142 @@ fun main() = runBlocking {
         bambuCameraService?.stop()
     }
 
+
+    /*
+     * ============================================================
+     * DETACH LIVE WORKFLOW
+     * ============================================================
+     *
+     * Used when this application itself stops/restarts while the
+     * print is still active. OBS and YouTube stay live, while the
+     * persisted jobId/broadcastId/streamId allows the next process
+     * to adopt the same broadcast.
+     */
+
+    suspend fun detachLive() {
+        val startupJob = studioStartupJob
+        studioStartupJob = null
+
+        startupJob?.cancelAndJoin()
+
+        liveStreamingService?.detach()
+
+        /*
+         * The camera bridge belongs to this process, so stop it.
+         * OBS stays live and the bridge is recreated on restart.
+         */
+        bambuCameraService?.stop()
+    }
+
+    /*
+     * ============================================================
+     * BAMBU CLOUD THUMBNAIL
+     * ============================================================
+     */
+
+    var bambuPrinterService: BambuPrinterService? = null
+    var thumbnailLookupJob: Job? = null
+    var thumbnailLookupJobId: String? = null
+
+    fun scheduleCloudThumbnailLookup(
+        jobId: String
+    ) {
+        if (thumbnailLookupJobId == jobId) {
+            return
+        }
+
+        val service =
+            bambuPrinterService
+                ?: return
+
+        thumbnailLookupJob?.cancel()
+        thumbnailLookupJobId = jobId
+
+        thumbnailLookupJob =
+            this@runBlocking.launch(Dispatchers.IO) {
+                try {
+                    repeat(5) { attempt ->
+                        val task =
+                            service.latestTask()
+
+                        val taskId =
+                            task?.id
+                                ?.trim()
+                                ?.takeIf {
+                                    it.isNotEmpty()
+                                }
+
+                        val coverUrl =
+                            task?.cover
+                                ?.trim()
+                                ?.takeIf {
+                                    it.isNotEmpty()
+                                }
+
+                        val taskMatches =
+                            taskId == null ||
+                                    taskId == jobId
+
+                        if (
+                            taskMatches &&
+                            coverUrl != null
+                        ) {
+                            automationLogger.info(
+                                "Bambu Cloud thumbnail found for job {}",
+                                jobId
+                            )
+
+                            ObsOverlayServer.updateThumbnail(
+                                jobId = jobId,
+                                coverUrl = coverUrl
+                            )
+
+                            return@launch
+                        }
+
+                        if (
+                            taskId != null &&
+                            taskId != jobId
+                        ) {
+                            automationLogger.debug(
+                                "Latest Bambu Cloud task {} does not yet match MQTT job {}",
+                                taskId,
+                                jobId
+                            )
+                        }
+
+                        if (attempt < 4) {
+                            delay(2000)
+                        }
+                    }
+
+                    automationLogger.warn(
+                        "No Bambu Cloud thumbnail available for job {}",
+                        jobId
+                    )
+
+                    ObsOverlayServer.markThumbnailUnavailable(
+                        jobId = jobId
+                    )
+                } catch (exception: CancellationException) {
+                    throw exception
+                } catch (exception: Exception) {
+                    automationLogger.warn(
+                        "Unable to retrieve Bambu Cloud thumbnail for job {}: {}",
+                        jobId,
+                        exception.message
+                    )
+
+                    ObsOverlayServer.markThumbnailUnavailable(
+                        jobId = jobId,
+                        error =
+                            exception.message
+                                ?: exception.javaClass.simpleName
+                    )
+                }
+            }
+    }
+
     /*
      * ============================================================
      * BAMBU EVENT HANDLER
@@ -697,6 +883,17 @@ fun main() = runBlocking {
 
     suspend fun handleEvent(event: BambuEvent) {
         bambuLogger.debug("{}", event)
+
+        (event as? BambuEvent.PrinterStatusEvent)
+            ?.snapshot
+            ?.jobId
+            ?.trim()
+            ?.takeIf {
+                it.isNotEmpty()
+            }
+            ?.let(
+                ::scheduleCloudThumbnailLookup
+            )
 
         val printName =
             (event as? BambuEvent.PrinterStatusEvent)
@@ -727,7 +924,11 @@ fun main() = runBlocking {
                         studioStartupJob =
                             this@runBlocking.launch(Dispatchers.IO) {
                                 startLive(
-                                    printName = printName
+                                    printName = printName,
+                                    jobId =
+                                        (event as? BambuEvent.PrinterStatusEvent)
+                                            ?.snapshot
+                                            ?.jobId
                                 )
                             }
                     }
@@ -744,11 +945,21 @@ fun main() = runBlocking {
 
                     AutomationAction.PrintFinished -> {
                         automationLogger.info("Print finished")
+
+                        thumbnailLookupJob?.cancel()
+                        thumbnailLookupJob = null
+                        thumbnailLookupJobId = null
+
                         stopLive()
                     }
 
                     AutomationAction.PrintFailed -> {
                         automationLogger.error("Print failed")
+
+                        thumbnailLookupJob?.cancel()
+                        thumbnailLookupJob = null
+                        thumbnailLookupJobId = null
+
                         stopLive()
                     }
                 }
@@ -831,8 +1042,11 @@ fun main() = runBlocking {
     val bambu =
         BambuPrinterService(
             token = token,
-            scope = this
+            scope = this,
+            configuredPrinterSerial = bambuPrinterSerial
         )
+
+    bambuPrinterService = bambu
 
     try {
         logger.info("Connecting to Bambu Cloud...")
@@ -847,7 +1061,15 @@ fun main() = runBlocking {
 
         awaitCancellation()
     } finally {
-        stopLive()
+        thumbnailLookupJob?.cancelAndJoin()
+        thumbnailLookupJob = null
+
+        /*
+         * Do not complete an active YouTube broadcast just because
+         * this process is restarting. PrintFinished / PrintFailed
+         * still call stopLive() and close it normally.
+         */
+        detachLive()
 
         logger.info("Disconnecting from Bambu Cloud...")
 

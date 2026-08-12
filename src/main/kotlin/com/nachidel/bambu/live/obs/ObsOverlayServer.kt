@@ -3,6 +3,7 @@ package com.nachidel.bambu.live.obs
 import com.nachidel.bambu.model.PrinterSnapshot
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import org.slf4j.LoggerFactory
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.InetSocketAddress
@@ -16,16 +17,27 @@ import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
-import java.util.zip.ZipInputStream
+
+data class ObsThumbnailImage(
+    val bytes: ByteArray,
+    val contentType: String
+)
 
 object ObsOverlayServer {
+    private val obsLogger = LoggerFactory.getLogger("Obs Overlay Server")
 
     private data class ThumbnailState(
         val jobId: String? = null,
         val requestKey: String? = null,
         val bytes: ByteArray? = null,
-        val status: String = "waiting-project-file",
+        val contentType: String? = null,
+        val status: String = "waiting-cloud-cover",
         val error: String? = null
+    )
+
+    private data class DownloadedThumbnail(
+        val bytes: ByteArray,
+        val contentType: String
     )
 
     private val snapshot =
@@ -68,9 +80,8 @@ object ObsOverlayServer {
 
     /**
      * Reçoit directement le snapshot publié par bambu-cloud-kotlin.
-     *
-     * Le téléchargement du 3MF est asynchrone afin de ne jamais
-     * bloquer le thread qui traite les événements Bambu.
+     * La miniature elle-même est fournie séparément par updateThumbnail()
+     * depuis le champ Cloud task.cover.
      */
     fun update(
         newSnapshot: PrinterSnapshot
@@ -98,11 +109,15 @@ object ObsOverlayServer {
                 ThumbnailState(
                     jobId = newSnapshot.jobId,
                     bytes = cached,
+                    contentType =
+                        cached?.let(
+                            ::detectContentType
+                        ),
                     status =
                         if (cached != null) {
                             "ready"
                         } else {
-                            "waiting-project-file"
+                            "waiting-cloud-cover"
                         }
                 )
             )
@@ -124,6 +139,7 @@ object ObsOverlayServer {
                     state.copy(
                         jobId = newSnapshot.jobId,
                         bytes = cached,
+                        contentType = detectContentType(cached),
                         status = "ready",
                         error = null
                     )
@@ -131,9 +147,72 @@ object ObsOverlayServer {
             }
         }
 
+    }
+
+    /**
+     * Télécharge directement la miniature renvoyée par l'API Cloud Bambu.
+     * L'opération reste asynchrone pour ne jamais bloquer le traitement MQTT.
+     */
+    fun updateThumbnail(
+        jobId: String,
+        coverUrl: String
+    ) {
+        val normalizedUrl =
+            coverUrl.trim()
+
+        if (normalizedUrl.isEmpty()) {
+            markThumbnailUnavailable(jobId)
+            return
+        }
+
         scheduleThumbnailDownload(
-            newSnapshot
+            jobId = jobId,
+            coverUrl = normalizedUrl
         )
+    }
+
+    fun currentThumbnail(
+        jobId: String
+    ): ObsThumbnailImage? {
+        val state = thumbnail.get()
+
+        if (
+            state.jobId != null &&
+            state.jobId != jobId
+        ) {
+            return null
+        }
+
+        val bytes =
+            state.bytes
+                ?: return null
+
+        return ObsThumbnailImage(
+            bytes = bytes.copyOf(),
+            contentType =
+                state.contentType
+                    ?: detectContentType(bytes)
+        )
+    }
+
+    fun markThumbnailUnavailable(
+        jobId: String,
+        error: String? = null
+    ) {
+        thumbnail.updateAndGet { state ->
+            if (
+                state.jobId != null &&
+                state.jobId != jobId
+            ) {
+                state
+            } else {
+                state.copy(
+                    jobId = jobId,
+                    status = "unavailable",
+                    error = error
+                )
+            }
+        }
     }
 
     /**
@@ -183,17 +262,17 @@ object ObsOverlayServer {
 
         server.start()
 
-        println(
+        obsLogger.info(
             "Overlay OBS disponible sur le port $port : " +
                     "http://<IP_DU_RASPBERRY>:$port/obs"
         )
 
-        println(
+        obsLogger.info(
             "API impression : " +
                     "http://<IP_DU_RASPBERRY>:$port/api/print"
         )
 
-        println(
+        obsLogger.info(
             "Thumbnail : " +
                     "http://<IP_DU_RASPBERRY>:$port/thumbnail"
         )
@@ -243,7 +322,7 @@ object ObsOverlayServer {
                 "thumbnailAvailable": $thumbnailAvailable,
                 "thumbnailStatus": ${jsonString(thumb.status)},
                 "thumbnailError": ${jsonString(thumb.error)},
-                "projectFileUrlAvailable": ${s.projectFileUrl != null}
+                "thumbnailSourceAvailable": ${thumb.requestKey != null}
             }
         """.trimIndent()
 
@@ -278,7 +357,8 @@ object ObsOverlayServer {
 
         exchange.responseHeaders.set(
             "Content-Type",
-            "image/png"
+            thumbnail.get().contentType
+                ?: detectContentType(image)
         )
 
         exchange.responseHeaders.set(
@@ -299,49 +379,27 @@ object ObsOverlayServer {
     }
 
     private fun scheduleThumbnailDownload(
-        newSnapshot: PrinterSnapshot
+        jobId: String,
+        coverUrl: String
     ) {
-        val url =
-            newSnapshot.projectFileUrl
-                ?.trim()
-                ?.takeIf {
-                    it.isNotEmpty()
-                }
-                ?: return
-
         val requestKey =
-            listOf(
-                newSnapshot.jobId.orEmpty(),
-                newSnapshot.plateIndex?.toString().orEmpty(),
-                url
-            ).joinToString(
-                separator = "|"
-            )
+            "$jobId|$coverUrl"
 
         val current =
             thumbnail.get()
 
-        /*
-         * Même URL / même plateau :
-         * pas de téléchargement en double.
-         */
         if (
             current.requestKey == requestKey
         ) {
             return
         }
 
-        /*
-         * On marque la requête avant de lancer le thread pour
-         * dédupliquer les événements MQTT rapprochés.
-         */
         thumbnail.set(
             current.copy(
-                jobId =
-                    newSnapshot.jobId
-                        ?: current.jobId,
+                jobId = jobId,
                 requestKey = requestKey,
                 bytes = null,
+                contentType = null,
                 status = "downloading",
                 error = null
             )
@@ -349,35 +407,24 @@ object ObsOverlayServer {
 
         thumbnailExecutor.execute {
             try {
-                val bytes =
+                val downloaded =
                     downloadThumbnail(
-                        projectFileUrl = url,
-                        plateIndex =
-                            newSnapshot.plateIndex
+                        coverUrl
                     )
 
-                newSnapshot.jobId
-                    ?.let { jobId ->
-                        saveCachedThumbnail(
-                            jobId = jobId,
-                            bytes = bytes
-                        )
-                    }
+                saveCachedThumbnail(
+                    jobId = jobId,
+                    bytes = downloaded.bytes
+                )
 
-                /*
-                 * Pendant le téléchargement, un autre job peut
-                 * avoir commencé. Dans ce cas on ignore le résultat
-                 * devenu obsolète.
-                 */
                 thumbnail.updateAndGet { state ->
                     if (
-                        state.requestKey ==
-                        requestKey
+                        state.requestKey == requestKey
                     ) {
                         state.copy(
-                            jobId =
-                                newSnapshot.jobId,
-                            bytes = bytes,
+                            jobId = jobId,
+                            bytes = downloaded.bytes,
+                            contentType = downloaded.contentType,
                             status = "ready",
                             error = null
                         )
@@ -386,34 +433,17 @@ object ObsOverlayServer {
                     }
                 }
 
-                println(
-                    "Thumbnail Bambu récupéré" +
-                            (
-                                    newSnapshot.plateIndex
-                                        ?.let {
-                                            " (plateau $it)"
-                                        }
-                                        ?: ""
-                                    )
+                obsLogger.info(
+                    "Thumbnail Bambu Cloud récupéré"
                 )
-
-            } catch (
-                exception: Exception
-            ) {
-                /*
-                 * On laisse requestKey en place pour éviter une
-                 * boucle de téléchargement sur chaque paquet MQTT.
-                 * Une nouvelle URL signée relancera naturellement
-                 * une tentative.
-                 */
+            } catch (exception: Exception) {
                 val message =
                     exception.message
                         ?: exception.javaClass.simpleName
 
                 thumbnail.updateAndGet { state ->
                     if (
-                        state.requestKey ==
-                        requestKey
+                        state.requestKey == requestKey
                     ) {
                         state.copy(
                             status = "error",
@@ -424,8 +454,8 @@ object ObsOverlayServer {
                     }
                 }
 
-                println(
-                    "Impossible de récupérer le thumbnail Bambu : " +
+                obsLogger.error(
+                    "Impossible de récupérer le thumbnail Bambu Cloud : " +
                             message
                 )
             }
@@ -446,6 +476,23 @@ object ObsOverlayServer {
 
         return thumbnailCacheDirectory
             .resolve(
+                "$safeJobId.image"
+            )
+    }
+
+    private fun legacyCacheFile(
+        jobId: String
+    ): Path {
+        val safeJobId =
+            jobId.replace(
+                Regex(
+                    """[^A-Za-z0-9._-]"""
+                ),
+                "_"
+            )
+
+        return thumbnailCacheDirectory
+            .resolve(
                 "$safeJobId.png"
             )
     }
@@ -456,13 +503,14 @@ object ObsOverlayServer {
 
         return runCatching {
             val file =
-                cacheFile(
-                    jobId
+                sequenceOf(
+                    cacheFile(jobId),
+                    legacyCacheFile(jobId)
                 )
-
-            if (!Files.isRegularFile(file)) {
-                return@runCatching null
-            }
+                    .firstOrNull(
+                        Files::isRegularFile
+                    )
+                    ?: return@runCatching null
 
             Files.readAllBytes(
                 file
@@ -484,7 +532,7 @@ object ObsOverlayServer {
                 bytes
             )
         }.onFailure { exception ->
-            println(
+            obsLogger.error(
                 "Impossible de mettre le thumbnail en cache : " +
                         (
                                 exception.message
@@ -495,18 +543,17 @@ object ObsOverlayServer {
     }
 
     private fun downloadThumbnail(
-        projectFileUrl: String,
-        plateIndex: Int?
-    ): ByteArray {
+        coverUrl: String
+    ): DownloadedThumbnail {
         val request =
             HttpRequest.newBuilder()
                 .uri(
                     URI.create(
-                        projectFileUrl
+                        coverUrl
                     )
                 )
                 .timeout(
-                    Duration.ofSeconds(60)
+                    Duration.ofSeconds(30)
                 )
                 .header(
                     "User-Agent",
@@ -528,137 +575,37 @@ object ObsOverlayServer {
             response.body().close()
 
             error(
-                "HTTP ${response.statusCode()} lors du téléchargement du 3MF"
+                "HTTP ${response.statusCode()} lors du téléchargement du cover Bambu"
             )
         }
 
-        response.body().use { body ->
-            return extractThumbnail(
-                input = body,
-                plateIndex = plateIndex
+        val bytes =
+            response.body().use(
+                ::readImageBytes
             )
-        }
-    }
 
-    private fun extractThumbnail(
-        input: InputStream,
-        plateIndex: Int?
-    ): ByteArray {
-        val preferredPath =
-            plateIndex
+        val contentType =
+            response.headers()
+                .firstValue("Content-Type")
+                .orElse(null)
+                ?.substringBefore(';')
+                ?.trim()
                 ?.takeIf {
-                    it > 0
-                }
-                ?.let {
-                    "metadata/plate_$it.png"
-                }
-
-        var firstPlateThumbnail:
-                ByteArray? = null
-
-        var genericThumbnail:
-                ByteArray? = null
-
-        ZipInputStream(
-            input.buffered()
-        ).use { zip ->
-            while (true) {
-                val entry =
-                    zip.nextEntry
-                        ?: break
-
-                if (
-                    entry.isDirectory
-                ) {
-                    zip.closeEntry()
-                    continue
-                }
-
-                val name =
-                    entry.name
-                        .replace(
-                            '\\',
-                            '/'
-                        )
-                        .lowercase()
-
-                val isPng =
-                    name.endsWith(
-                        ".png"
-                    )
-
-                if (!isPng) {
-                    zip.closeEntry()
-                    continue
-                }
-
-                /*
-                 * Priorité absolue au plateau réellement imprimé.
-                 */
-                if (
-                    preferredPath != null &&
-                    name == preferredPath
-                ) {
-                    return readCurrentZipEntry(
-                        zip
+                    it.startsWith(
+                        "image/",
+                        ignoreCase = true
                     )
                 }
+                ?: detectContentType(bytes)
 
-                /*
-                 * Fallback : premier aperçu de plateau disponible.
-                 */
-                if (
-                    firstPlateThumbnail == null &&
-                    name.matches(
-                        Regex(
-                            """metadata/plate_\d+\.png"""
-                        )
-                    )
-                ) {
-                    firstPlateThumbnail =
-                        readCurrentZipEntry(
-                            zip
-                        )
-
-                    zip.closeEntry()
-                    continue
-                }
-
-                /*
-                 * Certains 3MF Bambu exposent également cette image.
-                 */
-                if (
-                    genericThumbnail == null &&
-                    (
-                            name ==
-                                    "auxiliaries/.thumbnails/thumbnail_3mf.png" ||
-                                    name.contains(
-                                        "thumbnail"
-                                    )
-                            )
-                ) {
-                    genericThumbnail =
-                        readCurrentZipEntry(
-                            zip
-                        )
-
-                    zip.closeEntry()
-                    continue
-                }
-
-                zip.closeEntry()
-            }
-        }
-
-        return firstPlateThumbnail
-            ?: genericThumbnail
-            ?: error(
-                "Aucune vignette PNG trouvée dans le 3MF"
-            )
+        return DownloadedThumbnail(
+            bytes = bytes,
+            contentType = contentType
+        )
     }
 
-    private fun readCurrentZipEntry(
-        zip: ZipInputStream
+    private fun readImageBytes(
+        input: InputStream
     ): ByteArray {
         val output =
             ByteArrayOutputStream()
@@ -668,34 +615,25 @@ object ObsOverlayServer {
                 16 * 1024
             )
 
-        var total =
-            0
+        var total = 0
 
         while (true) {
             val read =
-                zip.read(
+                input.read(
                     buffer
                 )
 
-            if (
-                read < 0
-            ) {
+            if (read < 0) {
                 break
             }
 
-            total +=
-                read
+            total += read
 
-            /*
-             * Une vignette de plusieurs dizaines de Mo serait
-             * anormale : on protège le Raspberry d'un 3MF corrompu.
-             */
             if (
-                total >
-                MAX_THUMBNAIL_BYTES
+                total > MAX_THUMBNAIL_BYTES
             ) {
                 error(
-                    "Thumbnail 3MF trop volumineux"
+                    "Thumbnail Bambu trop volumineux"
                 )
             }
 
@@ -706,8 +644,42 @@ object ObsOverlayServer {
             )
         }
 
-        return output
-            .toByteArray()
+        return output.toByteArray()
+    }
+
+    private fun detectContentType(
+        bytes: ByteArray
+    ): String {
+        if (
+            bytes.size >= 8 &&
+            bytes[0] == 0x89.toByte() &&
+            bytes[1] == 0x50.toByte() &&
+            bytes[2] == 0x4E.toByte() &&
+            bytes[3] == 0x47.toByte()
+        ) {
+            return "image/png"
+        }
+
+        if (
+            bytes.size >= 3 &&
+            bytes[0] == 0xFF.toByte() &&
+            bytes[1] == 0xD8.toByte() &&
+            bytes[2] == 0xFF.toByte()
+        ) {
+            return "image/jpeg"
+        }
+
+        if (
+            bytes.size >= 12 &&
+            bytes.copyOfRange(0, 4)
+                .toString(StandardCharsets.US_ASCII) == "RIFF" &&
+            bytes.copyOfRange(8, 12)
+                .toString(StandardCharsets.US_ASCII) == "WEBP"
+        ) {
+            return "image/webp"
+        }
+
+        return "application/octet-stream"
     }
 
     private fun jsonNumber(
@@ -1029,7 +1001,7 @@ html, body {
 
                 <div>
                     <div class="label">
-                        Tête 0
+                        Tête gauche
                     </div>
                     <div
                         class="value"
@@ -1041,7 +1013,7 @@ html, body {
 
                 <div>
                     <div class="label">
-                        Tête 1
+                        Tête droite
                     </div>
                     <div
                         class="value"
@@ -1164,15 +1136,16 @@ function updateThumbnail(s) {
                 break;
 
             case "error":
+            case "unavailable":
                 placeholder.textContent =
                     "Aperçu indisponible";
                 break;
 
             default:
                 placeholder.textContent =
-                    s.projectFileUrlAvailable
+                    s.thumbnailSourceAvailable
                         ? "Préparation de l'aperçu…"
-                        : "En attente du projet Bambu";
+                        : "Recherche de l'aperçu Bambu…";
                 break;
         }
 

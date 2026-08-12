@@ -15,7 +15,8 @@ class LiveStreamingService(
     private val obsHost: String,
     private val obsPort: Int,
     private val obsPassword: String?,
-    private val privacyStatus: String = "private"
+    private val privacyStatus: String = "private",
+    private val sessionStore: LiveSessionStore = LiveSessionStore()
 ) {
     private val logger = LoggerFactory.getLogger("LiveStreaming")
     private val mutex = Mutex()
@@ -45,7 +46,12 @@ class LiveStreamingService(
         }
     }
 
-    suspend fun start(printName: String): Boolean =
+    suspend fun start(
+        printName: String,
+        jobId: String? = null,
+        thumbnailBytes: ByteArray? = null,
+        thumbnailContentType: String? = null
+    ): Boolean =
         mutex.withLock {
             if (state == LiveStreamingState.LIVE) {
                 logger.info("Live streaming is already running")
@@ -56,6 +62,11 @@ class LiveStreamingService(
                 logger.warn("Unable to start live streaming because current state is {}", state)
                 return@withLock false
             }
+
+            val normalizedJobId =
+                jobId
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
 
             state = LiveStreamingState.STARTING
             var startupCompleted = false
@@ -82,20 +93,6 @@ class LiveStreamingService(
                 val initialObsStatus = obs.getStreamStatus()
 
                 /*
-                 * Critical safety rule:
-                 *
-                 * If OBS was already streaming before us, we do not
-                 * touch that stream and we do not claim ownership.
-                 */
-                if (initialObsStatus.active) {
-                    logger.warn(
-                        "OBS stream was already active - live automation will not take ownership"
-                    )
-
-                    return@withLock false
-                }
-
-                /*
                  * ====================================================
                  * PREPARE REUSABLE YOUTUBE STREAM
                  * ====================================================
@@ -116,81 +113,202 @@ class LiveStreamingService(
 
                 /*
                  * ====================================================
-                 * CONFIGURE OBS
+                 * RESUME EXISTING SESSION WHEN POSSIBLE
                  * ====================================================
                  */
 
-                logger.info("Configuring OBS YouTube destination")
-
-                obs.setCustomStreamService(
-                    server = server,
-                    key = streamKey
-                )
-
-                val obsSettings = obs.getStreamServiceSettings()
-
-                logger.info(
-                    "OBS stream destination ready: type={} server={}",
-                    obsSettings.type,
-                    obsSettings.server
-                )
-
-                /*
-                 * ====================================================
-                 * CREATE YOUTUBE BROADCAST
-                 * ====================================================
-                 */
-
-                val title =
-                    if (printName.isBlank()) {
-                        "Impression 3D"
-                    } else {
-                        "Impression 3D - ${printName.trim()}"
-                    }
-
-                logger.info(
-                    "Creating YouTube broadcast: '{}' privacy={}",
-                    title,
-                    privacyStatus
-                )
-
-                val createdBroadcast =
-                    youtube.createBroadcastAndBind(
-                        title = title,
-                        description = "Diffusion automatique de l'impression 3D",
-                        privacyStatus = privacyStatus,
+                val resumedBroadcast =
+                    findResumableBroadcast(
+                        jobId = normalizedJobId,
                         streamId = youtubeStream.id
                     )
 
-                broadcast = createdBroadcast
+                if (
+                    initialObsStatus.active &&
+                    resumedBroadcast == null
+                ) {
+                    logger.warn(
+                        "OBS stream was already active but no matching Bambu/YouTube session was found - refusing to take ownership"
+                    )
+
+                    return@withLock false
+                }
+
+                if (resumedBroadcast != null) {
+                    broadcast = resumedBroadcast
+                    state = LiveStreamingState.BROADCAST_READY
+
+                    logger.info(
+                        "Resuming YouTube broadcast {} for Bambu job {} lifecycle={}",
+                        resumedBroadcast.id,
+                        normalizedJobId,
+                        resumedBroadcast.lifeCycleStatus
+                    )
+
+                    if (
+                        initialObsStatus.active &&
+                        resumedBroadcast.lifeCycleStatus == "live"
+                    ) {
+                        /*
+                         * OBS is already streaming and YouTube confirms that the
+                         * persisted broadcast is still LIVE. This is the exact
+                         * crash/restart recovery case, so ownership can safely
+                         * be adopted for this same Bambu job.
+                         */
+                        streamStartRequestedByAutomation = true
+                        streamStartedByAutomation = true
+                        state = LiveStreamingState.LIVE
+                        startupCompleted = true
+
+                        logger.info(
+                            "Existing OBS/YouTube live session successfully adopted"
+                        )
+
+                        return@withLock true
+                    }
+                }
+
+                /*
+                 * ====================================================
+                 * CONFIGURE OBS
+                 * ====================================================
+                 *
+                 * Never change OBS stream settings while it is already
+                 * streaming. If it is active here, it was validated above as
+                 * belonging to the persisted session for this same Bambu job.
+                 */
+
+                if (!initialObsStatus.active) {
+                    logger.info("Configuring OBS YouTube destination")
+
+                    obs.setCustomStreamService(
+                        server = server,
+                        key = streamKey
+                    )
+
+                    val obsSettings = obs.getStreamServiceSettings()
+
+                    logger.info(
+                        "OBS stream destination ready: type={} server={}",
+                        obsSettings.type,
+                        obsSettings.server
+                    )
+                }
+
+                /*
+                 * ====================================================
+                 * CREATE OR REUSE YOUTUBE BROADCAST
+                 * ====================================================
+                 */
+
+                val targetBroadcast =
+                    resumedBroadcast
+                        ?: run {
+                            val title =
+                                if (printName.isBlank()) {
+                                    "Impression 3D"
+                                } else {
+                                    "Impression 3D - ${printName.trim()}"
+                                }
+
+                            logger.info(
+                                "Creating YouTube broadcast: '{}' privacy={}",
+                                title,
+                                privacyStatus
+                            )
+
+                            youtube.createBroadcastAndBind(
+                                title = title,
+                                description = "Diffusion automatique de l'impression 3D",
+                                privacyStatus = privacyStatus,
+                                streamId = youtubeStream.id
+                            )
+                                .also { created ->
+                                    broadcast = created
+                                    state = LiveStreamingState.BROADCAST_READY
+
+                                    if (normalizedJobId != null) {
+                                        sessionStore.save(
+                                            PersistedLiveSession(
+                                                jobId = normalizedJobId,
+                                                broadcastId = created.id,
+                                                streamId = youtubeStream.id
+                                            )
+                                        )
+
+                                        logger.info(
+                                            "YouTube live session persisted for Bambu job {}",
+                                            normalizedJobId
+                                        )
+                                    }
+                                }
+                        }
+
+                broadcast = targetBroadcast
                 state = LiveStreamingState.BROADCAST_READY
 
                 logger.info(
                     "YouTube broadcast ready: id={} lifecycle={} privacy={}",
-                    createdBroadcast.id,
-                    createdBroadcast.lifeCycleStatus,
+                    targetBroadcast.id,
+                    targetBroadcast.lifeCycleStatus,
                     privacyStatus
                 )
 
+                if (
+                    thumbnailBytes != null &&
+                    thumbnailContentType != null
+                ) {
+                    try {
+                        youtube.setThumbnail(
+                            videoId = targetBroadcast.id,
+                            image = thumbnailBytes,
+                            contentType = thumbnailContentType
+                        )
+
+                        logger.info(
+                            "YouTube thumbnail set from Bambu Cloud cover"
+                        )
+                    } catch (exception: Exception) {
+                        logger.warn(
+                            "Unable to set YouTube thumbnail: {}",
+                            exception.message
+                        )
+                    }
+                } else {
+                    logger.warn(
+                        "No Bambu Cloud thumbnail available for YouTube broadcast"
+                    )
+                }
+
                 /*
                  * ====================================================
-                 * START OBS
+                 * START OR ADOPT OBS
                  * ====================================================
                  */
 
-                logger.info("Starting OBS stream")
+                if (initialObsStatus.active) {
+                    logger.info(
+                        "OBS stream is already active for the resumed session"
+                    )
 
-                streamStartRequestedByAutomation = true
-                obs.startStream()
+                    streamStartRequestedByAutomation = true
+                    streamStartedByAutomation = true
+                    state = LiveStreamingState.OBS_STREAMING
+                } else {
+                    logger.info("Starting OBS stream")
 
-                if (!waitForObsStreamStart(obs)) {
-                    error("OBS stream did not become active")
+                    streamStartRequestedByAutomation = true
+                    obs.startStream()
+
+                    if (!waitForObsStreamStart(obs)) {
+                        error("OBS stream did not become active")
+                    }
+
+                    streamStartedByAutomation = true
+                    state = LiveStreamingState.OBS_STREAMING
+
+                    logger.info("OBS stream is active")
                 }
-
-                streamStartedByAutomation = true
-                state = LiveStreamingState.OBS_STREAMING
-
-                logger.info("OBS stream is active")
 
                 /*
                  * ====================================================
@@ -210,37 +328,65 @@ class LiveStreamingService(
 
                 /*
                  * ====================================================
-                 * TRANSITION BROADCAST TO LIVE
+                 * ENSURE BROADCAST IS LIVE
                  * ====================================================
                  */
 
-                logger.info(
-                    "Transitioning YouTube broadcast {} to LIVE",
-                    createdBroadcast.id
-                )
+                val currentBroadcast =
+                    youtube.getBroadcast(targetBroadcast.id)
 
-                state = LiveStreamingState.LIVE_STARTING
-
-                val transition =
-                    youtube.transitionBroadcast(
-                        broadcastId = createdBroadcast.id,
-                        status = "live"
-                    )
-
-                logger.info(
-                    "YouTube LIVE transition response: lifecycle={}",
-                    transition.lifeCycleStatus
-                )
-
-                val liveReached =
-                    if (transition.lifeCycleStatus == "live") {
-                        true
-                    } else {
-                        waitForBroadcastLive(createdBroadcast.id)
+                when (currentBroadcast.lifeCycleStatus) {
+                    "live" -> {
+                        logger.info(
+                            "YouTube broadcast {} is already LIVE",
+                            currentBroadcast.id
+                        )
                     }
 
-                if (!liveReached) {
-                    error("YouTube broadcast did not reach LIVE")
+                    "liveStarting" -> {
+                        state = LiveStreamingState.LIVE_STARTING
+
+                        if (!waitForBroadcastLive(currentBroadcast.id)) {
+                            error("YouTube broadcast did not reach LIVE")
+                        }
+                    }
+
+                    "ready",
+                    "testing" -> {
+                        logger.info(
+                            "Transitioning YouTube broadcast {} to LIVE",
+                            currentBroadcast.id
+                        )
+
+                        state = LiveStreamingState.LIVE_STARTING
+
+                        val transition =
+                            youtube.transitionBroadcast(
+                                broadcastId = currentBroadcast.id,
+                                status = "live"
+                            )
+
+                        logger.info(
+                            "YouTube LIVE transition response: lifecycle={}",
+                            transition.lifeCycleStatus
+                        )
+
+                        val liveReached =
+                            if (transition.lifeCycleStatus == "live") {
+                                true
+                            } else {
+                                waitForBroadcastLive(currentBroadcast.id)
+                            }
+
+                        if (!liveReached) {
+                            error("YouTube broadcast did not reach LIVE")
+                        }
+                    }
+
+                    else ->
+                        error(
+                            "YouTube broadcast cannot be resumed from lifecycle=${currentBroadcast.lifeCycleStatus}"
+                        )
                 }
 
                 state = LiveStreamingState.LIVE
@@ -248,7 +394,7 @@ class LiveStreamingService(
 
                 logger.info(
                     "YouTube broadcast is LIVE: {}",
-                    createdBroadcast.id
+                    targetBroadcast.id
                 )
 
                 true
@@ -269,6 +415,21 @@ class LiveStreamingService(
             }
         }
 
+    /**
+     * Disconnect this process from OBS without stopping OBS or completing the
+     * YouTube broadcast. The persisted session remains on disk so a new
+     * process can adopt it if Bambu reports the same jobId.
+     */
+    suspend fun detach() =
+        mutex.withLock {
+            logger.info(
+                "Detaching from live session without stopping OBS/YouTube"
+            )
+
+            closeObsConnection()
+            resetState()
+        }
+
     suspend fun stop() =
         mutex.withLock {
             if (
@@ -276,6 +437,7 @@ class LiveStreamingService(
                 broadcast == null &&
                 !streamStartRequestedByAutomation
             ) {
+                sessionStore.clear()
                 logger.info("Live streaming is already stopped")
                 return@withLock
             }
@@ -308,6 +470,7 @@ class LiveStreamingService(
             }
 
             closeObsConnection()
+            sessionStore.clear()
             resetState()
 
             logger.info("Live streaming stopped")
@@ -318,6 +481,82 @@ class LiveStreamingService(
 
     fun currentState(): LiveStreamingState =
         state
+
+    private suspend fun findResumableBroadcast(
+        jobId: String?,
+        streamId: String
+    ): YouTubeLiveBroadcastInfo? {
+        val resolvedJobId =
+            jobId
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return null
+
+        val session =
+            sessionStore.load()
+                ?: return null
+
+        if (session.jobId != resolvedJobId) {
+            logger.info(
+                "Persisted YouTube session belongs to Bambu job {}, current job is {}",
+                session.jobId,
+                resolvedJobId
+            )
+
+            return null
+        }
+
+        if (session.streamId != streamId) {
+            logger.warn(
+                "Persisted YouTube session uses a different reusable stream - it will not be resumed"
+            )
+
+            return null
+        }
+
+        val current =
+            try {
+                youtube.getBroadcast(session.broadcastId)
+            } catch (exception: Exception) {
+                logger.warn(
+                    "Unable to validate persisted YouTube broadcast {}: {}",
+                    session.broadcastId,
+                    exception.message
+                )
+
+                return null
+            }
+
+        if (current.boundStreamId != streamId) {
+            logger.warn(
+                "Persisted YouTube broadcast {} is no longer bound to the expected stream",
+                current.id
+            )
+
+            return null
+        }
+
+        if (
+            current.lifeCycleStatus !in
+            setOf(
+                "ready",
+                "testing",
+                "liveStarting",
+                "live"
+            )
+        ) {
+            logger.info(
+                "Persisted YouTube broadcast {} cannot be resumed because lifecycle={}",
+                current.id,
+                current.lifeCycleStatus
+            )
+
+            sessionStore.clear()
+            return null
+        }
+
+        return current
+    }
 
     private suspend fun waitForObsStreamStart(obs: ObsWebSocketClient): Boolean {
         for (attempt in 1..15) {
